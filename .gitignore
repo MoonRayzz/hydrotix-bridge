@@ -1,0 +1,4 @@
+# files yang tidak boleh masuk GitHub
+node_modules/
+serviceAccountKey.json
+.env
