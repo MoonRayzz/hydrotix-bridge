@@ -73,7 +73,7 @@ client.on('message', async (topic, message) => {
   }
 
   if (type === 'telemetry') await handleTelemetry(userId, deviceId, data);
-  if (type === 'heartbeat') await handleHeartbeat(userId, deviceId, data); // kirim data agar mac/ip tersimpan
+  if (type === 'heartbeat') await handleHeartbeat(userId, deviceId, data); 
 });
 
 // ── HANDLER ZTP (ZERO TOUCH PROVISIONING) ──────────────────────────
@@ -120,17 +120,20 @@ async function handleTelemetry(userId, deviceId, data) {
     const deviceRef = db.collection('devices').doc(deviceId);
     const deviceSnap = await deviceRef.get();
 
-    // Pastikan device sudah di-provisioning dari web
+    // CLOUD SELF-DESTRUCT SIGNAL (Jika alat sudah dihapus di web admin)
     if (!deviceSnap.exists) {
-      console.log(`[WARNING] Device ${deviceId} belum terdaftar di sistem. Mengabaikan telemetry.`);
+      console.log(`[WARNING] Device ${deviceId} telah dihapus dari sistem. Mengirim sinyal Factory Reset ke ESP32!`);
+      
+      const killTopic = `hydro/${userId}/${deviceId}/command`;
+      const killPayload = JSON.stringify({ target: "factory_reset", state: true });
+      
+      client.publish(killTopic, killPayload, { qos: 1 });
       return;
     }
 
-    // Gunakan ownerId yang sah dari database, JANGAN percaya pada userId dari topic ESP32
-    // karena bisa jadi ESP32 masih menyimpan hardcode user lama
     const validOwnerId = deviceSnap.data().ownerId;
 
-    // 1. Simpan ke devices/{deviceId}/readings (sesuai schema Reading)
+    // 1. Simpan ke devices/{deviceId}/readings
     const ref = await deviceRef
       .collection('readings')
       .add({
@@ -147,13 +150,11 @@ async function handleTelemetry(userId, deviceId, data) {
       });
     console.log(`[FIRESTORE] ✅ Reading tersimpan → ${ref.id}`);
 
-    // 2. Update dokumen utama device (merge agar field lain tetap ada)
-    // PERHATIAN: ownerId TIDAK DIUPDATE di sini agar tidak tertimpa
+    // 2. Update dokumen utama device
     await deviceRef.set({
       status:   'online',
       isOnline: true,
       lastSeen: now,
-      // Cache nilai terakhir di dokumen utama (bisa dipakai mobile app)
       lastReading: {
         ph:         data.ph         ?? null,
         tds:        data.tds        ?? null,
@@ -207,8 +208,14 @@ async function handleHeartbeat(userId, deviceId, data = {}) {
     const deviceRef = db.collection('devices').doc(deviceId);
     const deviceSnap = await deviceRef.get();
 
+    // CLOUD SELF-DESTRUCT SIGNAL (Jika alat sudah dihapus di web admin)
     if (!deviceSnap.exists) {
-      console.log(`[WARNING] Heartbeat dari device ${deviceId} yang belum di-provisioning. Abaikan.`);
+      console.log(`[WARNING] Heartbeat dari device ${deviceId} yang telah dihapus. Mengirim sinyal Factory Reset ke ESP32!`);
+      
+      const killTopic = `hydro/${userId}/${deviceId}/command`;
+      const killPayload = JSON.stringify({ target: "factory_reset", state: true });
+      
+      client.publish(killTopic, killPayload, { qos: 1 });
       return;
     }
 
@@ -228,7 +235,6 @@ async function handleHeartbeat(userId, deviceId, data = {}) {
 }
 
 // ── DETEKSI DEVICE OFFLINE ─────────────────────────────────────────
-// Tiap 5 menit — device yang lastSeen > 5 menit → set offline
 async function checkOfflineDevices() {
   const cutoff = new Date(Date.now() - 5 * 60 * 1000);
   try {
@@ -259,8 +265,6 @@ setInterval(() => {
 
 console.log('[SYSTEM] HydroTix Bridge — Render Edition siap!');
 console.log('[SYSTEM] Menunggu data dari ESP32...\n');
-
-// ... (kode MQTT dan fungsi checkOfflineDevices biarkan seperti semula)
 
 // ── DUMMY WEB SERVER UNTUK RENDER.COM ──────────────────────────────
 const express = require('express');
