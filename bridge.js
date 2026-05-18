@@ -1,3 +1,5 @@
+// hydrotix-bridge/bridge.js
+require('dotenv').config(); // load dari file .env secara otomatis
 const mqtt  = require('mqtt');
 const admin = require('firebase-admin');
 
@@ -36,6 +38,11 @@ client.on('connect', () => {
     if (!err) console.log('[BRIDGE] Subscribe: hydro/+/+/heartbeat');
     else      console.error('[BRIDGE] Subscribe error:', err.message);
   });
+
+  client.subscribe('hydro/setup/+/request', { qos: 1 }, (err) => {
+    if (!err) console.log('[BRIDGE] Subscribe: hydro/setup/+/request (ZTP)');
+    else      console.error('[BRIDGE] Subscribe error:', err.message);
+  });
 });
 
 client.on('reconnect', () => console.log('[BRIDGE] Reconnecting...'));
@@ -45,6 +52,14 @@ client.on('offline',   () => console.log('[BRIDGE] Offline'));
 // ── MESSAGE HANDLER ────────────────────────────────────────────────
 client.on('message', async (topic, message) => {
   const parts = topic.split('/');
+  
+  // Deteksi ZTP Request
+  if (parts.length === 4 && parts[0] === 'hydro' && parts[1] === 'setup' && parts[3] === 'request') {
+    const macAddress = parts[2];
+    await handleZtpRequest(macAddress);
+    return;
+  }
+
   if (parts.length !== 4 || parts[0] !== 'hydro') return;
 
   const [, userId, deviceId, type] = parts;
@@ -58,19 +73,65 @@ client.on('message', async (topic, message) => {
   }
 
   if (type === 'telemetry') await handleTelemetry(userId, deviceId, data);
-  if (type === 'heartbeat') await handleHeartbeat(userId, deviceId);
+  if (type === 'heartbeat') await handleHeartbeat(userId, deviceId, data); // kirim data agar mac/ip tersimpan
 });
+
+// ── HANDLER ZTP (ZERO TOUCH PROVISIONING) ──────────────────────────
+async function handleZtpRequest(macAddress) {
+  console.log(`\n[ZTP] 🔍 Menerima permintaan setup dari MAC: ${macAddress}`);
+  try {
+    const devicesRef = db.collection('devices');
+    const snapshot = await devicesRef.where('macAddress', '==', macAddress).limit(1).get();
+
+    if (snapshot.empty) {
+      console.log(`[ZTP] ❌ Device dengan MAC ${macAddress} belum didaftarkan di Web Admin.`);
+      return;
+    }
+
+    const doc = snapshot.docs[0];
+    const data = doc.data();
+
+    if (!data.ownerId) {
+      console.log(`[ZTP] ❌ Device ditemukan tapi ownerId kosong.`);
+      return;
+    }
+
+    const payload = JSON.stringify({
+      ownerId: data.ownerId,
+      deviceId: doc.id
+    });
+
+    const topicResponse = `hydro/setup/${macAddress}/response`;
+    client.publish(topicResponse, payload, { qos: 1 });
+    
+    console.log(`[ZTP] ✅ Berhasil mengirim profil ke ESP32: ${topicResponse} -> ${payload}`);
+
+  } catch (err) {
+    console.error(`[ERROR] ZTP ${macAddress}:`, err.message);
+  }
+}
 
 // ── HANDLER TELEMETRY ──────────────────────────────────────────────
 async function handleTelemetry(userId, deviceId, data) {
-  console.log(`\n[TELEMETRY] device: ${deviceId} | user: ${userId}`);
+  console.log(`\n[TELEMETRY] device: ${deviceId} | topic_user: ${userId}`);
   const now = admin.firestore.FieldValue.serverTimestamp();
 
   try {
+    const deviceRef = db.collection('devices').doc(deviceId);
+    const deviceSnap = await deviceRef.get();
+
+    // Pastikan device sudah di-provisioning dari web
+    if (!deviceSnap.exists) {
+      console.log(`[WARNING] Device ${deviceId} belum terdaftar di sistem. Mengabaikan telemetry.`);
+      return;
+    }
+
+    // Gunakan ownerId yang sah dari database, JANGAN percaya pada userId dari topic ESP32
+    // karena bisa jadi ESP32 masih menyimpan hardcode user lama
+    const validOwnerId = deviceSnap.data().ownerId;
+
     // 1. Simpan ke devices/{deviceId}/readings (sesuai schema Reading)
-    const ref = await db
-      .collection('devices')
-      .doc(deviceId)
+    const ref = await deviceRef
       .collection('readings')
       .add({
         timestamp:   now,
@@ -87,9 +148,8 @@ async function handleTelemetry(userId, deviceId, data) {
     console.log(`[FIRESTORE] ✅ Reading tersimpan → ${ref.id}`);
 
     // 2. Update dokumen utama device (merge agar field lain tetap ada)
-    await db.collection('devices').doc(deviceId).set({
-      id:       deviceId,
-      ownerId:  userId,
+    // PERHATIAN: ownerId TIDAK DIUPDATE di sini agar tidak tertimpa
+    await deviceRef.set({
       status:   'online',
       isOnline: true,
       lastSeen: now,
@@ -112,7 +172,7 @@ async function handleTelemetry(userId, deviceId, data) {
     if (data.alert === true) {
       await db.collection('alerts').add({
         deviceId:  deviceId,
-        userId:    userId,
+        userId:    validOwnerId,
         parameter: 'sensor_anomaly',
         severity:  'warning',
         value:     data.waterTemp ?? 0,
@@ -127,7 +187,7 @@ async function handleTelemetry(userId, deviceId, data) {
     await db.collection('logs').add({
       type:      'telemetry',
       deviceId:  deviceId,
-      userId:    userId,
+      userId:    validOwnerId,
       note:      `Telemetry diterima dari ${deviceId}`,
       currentPh:   data.ph         ?? 0,
       currentTds:  data.tds        ?? 0,
@@ -141,16 +201,27 @@ async function handleTelemetry(userId, deviceId, data) {
 }
 
 // ── HANDLER HEARTBEAT ──────────────────────────────────────────────
-async function handleHeartbeat(userId, deviceId) {
-  console.log(`[HEARTBEAT] 💓 ${deviceId} masih online`);
+async function handleHeartbeat(userId, deviceId, data = {}) {
+  console.log(`[HEARTBEAT] 💓 ${deviceId} | MAC: ${data.macAddress || '-'} | IP: ${data.ip || '-'}`);
   try {
-    await db.collection('devices').doc(deviceId).set({
-      id:       deviceId,
-      ownerId:  userId,
+    const deviceRef = db.collection('devices').doc(deviceId);
+    const deviceSnap = await deviceRef.get();
+
+    if (!deviceSnap.exists) {
+      console.log(`[WARNING] Heartbeat dari device ${deviceId} yang belum di-provisioning. Abaikan.`);
+      return;
+    }
+
+    const update = {
       status:   'online',
       isOnline: true,
       lastSeen: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
+    };
+    if (data.macAddress) update.macAddress = data.macAddress;
+    if (data.ip)         update.ip         = data.ip;
+    if (data.firmware)   update.firmwareVersion = data.firmware;
+
+    await deviceRef.set(update, { merge: true });
   } catch (err) {
     console.error(`[ERROR] Heartbeat ${deviceId}:`, err.message);
   }
@@ -188,3 +259,18 @@ setInterval(() => {
 
 console.log('[SYSTEM] HydroTix Bridge — Render Edition siap!');
 console.log('[SYSTEM] Menunggu data dari ESP32...\n');
+
+// ... (kode MQTT dan fungsi checkOfflineDevices biarkan seperti semula)
+
+// ── DUMMY WEB SERVER UNTUK RENDER.COM ──────────────────────────────
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.send('HydroTix MQTT Bridge is Running 24/7!');
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[SERVER] Dummy web server berjalan di port ${PORT}`);
+});
