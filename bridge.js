@@ -104,7 +104,10 @@ async function handleTelemetry(userId, deviceId, data) {
       relayStates: data.relayStates ?? {},
     });
 
-    await deviceRef.set({
+    // Sinkronisasi lastReading DAN state relay aktual dari ESP32 ke Firestore.
+    // Dengan ini, field 'relays' di Firestore selalu mencerminkan state nyata hardware,
+    // BUKAN hanya perintah terakhir dari HP. Ini sumber kebenaran tunggal.
+    const updatePayload = {
       status: 'online', isOnline: true, lastSeen: now,
       lastReading: {
         ph: data.ph ?? null, tds: data.tds ?? null,
@@ -112,7 +115,14 @@ async function handleTelemetry(userId, deviceId, data) {
         humidity: data.humidity ?? null, waterLevel: data.waterLevel ?? null,
         do: data.do ?? null, alert: data.alert ?? false, updatedAt: now,
       },
-    }, { merge: true });
+    };
+
+    // Sinkronisasi state relay dari telemetry (relayStates dikirim ESP32)
+    if (data.relayStates && typeof data.relayStates === 'object') {
+      updatePayload.relays = data.relayStates;
+    }
+
+    await deviceRef.set(updatePayload, { merge: true });
 
     if (data.alert === true) {
       await db.collection('alerts').add({
@@ -126,6 +136,7 @@ async function handleTelemetry(userId, deviceId, data) {
     console.error(`[ERROR] Telemetry:`, err.message);
   }
 }
+
 
 // ── HANDLER HEARTBEAT ──────────────────────────────────────────────
 async function handleHeartbeat(userId, deviceId, data = {}) {
